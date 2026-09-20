@@ -1,11 +1,11 @@
-"""SQLite 持久化层：连接、建表与文档/修订/幂等请求的读写。"""
+"""SQLite 持久化层：连接、建表与文档/修订/幂等请求/写入租约的读写。"""
 from __future__ import annotations
 
 import json
 import os
 import sqlite3
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Iterator, Optional
 
 from .config import settings
@@ -52,11 +52,36 @@ CREATE TABLE IF NOT EXISTS releases (
     results     TEXT NOT NULL,
     created_at  TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS leases (
+    document_id   TEXT PRIMARY KEY REFERENCES documents(id),
+    holder        TEXT NOT NULL,
+    fencing_token INTEGER NOT NULL,
+    acquired_at   TEXT NOT NULL,
+    expires_at    TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS lease_fencing (
+    id         INTEGER PRIMARY KEY CHECK (id = 1),
+    next_token INTEGER NOT NULL
+);
+
+INSERT OR IGNORE INTO lease_fencing (id, next_token) VALUES (1, 1);
 """
 
 
 def utcnow() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
+
+
+def utc_after(seconds: float) -> str:
+    """服务端 UTC 当前时间 + *seconds* 的时间戳（与 :func:`utcnow` 同格式）。
+
+    租约过期时间由服务端生成；词法序与时间序一致，可直接用字符串比较判断过期。
+    """
+    return (
+        datetime.now(timezone.utc) + timedelta(seconds=seconds)
+    ).isoformat(timespec="microseconds").replace("+00:00", "Z")
 
 
 def canonical(value: Any) -> str:
@@ -279,3 +304,55 @@ def insert_release(
         " VALUES (?, ?, ?, ?)",
         (release_id, fingerprint, canonical(results), now),
     )
+
+
+# ---------- 写入租约 ----------
+
+
+def get_lease(conn: sqlite3.Connection, doc_id: str) -> Optional[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM leases WHERE document_id = ?", (doc_id,)
+    ).fetchone()
+
+
+def upsert_lease(
+    conn: sqlite3.Connection,
+    doc_id: str,
+    holder: str,
+    fencing_token: int,
+    acquired_at: str,
+    expires_at: str,
+) -> None:
+    """调用方需已开启写事务。新建或整体替换（过期后接管）文档租约。"""
+    conn.execute(
+        "INSERT INTO leases (document_id, holder, fencing_token, acquired_at, expires_at)"
+        " VALUES (?, ?, ?, ?, ?)"
+        " ON CONFLICT(document_id) DO UPDATE SET"
+        "   holder = excluded.holder, fencing_token = excluded.fencing_token,"
+        "   acquired_at = excluded.acquired_at, expires_at = excluded.expires_at",
+        (doc_id, holder, fencing_token, acquired_at, expires_at),
+    )
+
+
+def update_lease_expiry(conn: sqlite3.Connection, doc_id: str, expires_at: str) -> None:
+    """调用方需已开启写事务。仅刷新过期时间（续期 / 重复获取），token 保持不变。"""
+    conn.execute(
+        "UPDATE leases SET expires_at = ? WHERE document_id = ?",
+        (expires_at, doc_id),
+    )
+
+
+def delete_lease(conn: sqlite3.Connection, doc_id: str) -> None:
+    """调用方需已开启写事务。租约不存在时为 no-op。"""
+    conn.execute("DELETE FROM leases WHERE document_id = ?", (doc_id,))
+
+
+def next_fencing_token(conn: sqlite3.Connection) -> int:
+    """调用方需已开启写事务。返回全局严格递增的 fencing token（从 1 开始）。
+
+    计数器独立于租约行：租约释放 / 被接管都不会使 token 回退，
+    因此过期租约的旧 token 永久失效。
+    """
+    conn.execute("UPDATE lease_fencing SET next_token = next_token + 1 WHERE id = 1")
+    row = conn.execute("SELECT next_token FROM lease_fencing WHERE id = 1").fetchone()
+    return int(row["next_token"]) - 1

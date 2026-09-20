@@ -101,6 +101,12 @@ class UpdateDocument(StrictModel):
         description="可选前置条件：写事务内先按输入顺序检查当前修订，全部通过才合并",
     )
     author: Optional[str] = Field(default=None, max_length=200)
+    lease_token: Optional[int] = Field(
+        default=None,
+        ge=1,
+        description="写入租约 token：目标文档存在未过期租约时必须等于当前 fencing token；"
+        "无有效租约时携带 token 同样被拒绝（旧 token 已失效）",
+    )
 
     @field_validator("patch")
     @classmethod
@@ -160,6 +166,11 @@ class ReleaseItem(StrictModel):
         description="可选前置条件：写事务内先按输入顺序检查当前修订，全部通过才合并",
     )
     author: Optional[str] = Field(default=None, max_length=200)
+    lease_token: Optional[int] = Field(
+        default=None,
+        ge=1,
+        description="写入租约 token：目标文档存在未过期租约时必须等于当前 fencing token",
+    )
 
     @field_validator("patch")
     @classmethod
@@ -196,3 +207,38 @@ class CreateRelease(StrictModel):
                 f"updates 中的 document_id 必须互不重复，重复项: {', '.join(duplicates)}"
             )
         return self
+
+
+# ---------------------------------------------------------------- 写入租约
+
+
+class AcquireLease(StrictModel):
+    holder: str = Field(
+        ..., min_length=1, max_length=200, description="租约持有者标识（如服务名 / 工单号）"
+    )
+    ttl_seconds: float = Field(
+        default=30,
+        gt=0,
+        le=3600,
+        description="租约时长（秒，支持小数），从本次获取 / 续期成功起算",
+    )
+
+
+class RenewLease(StrictModel):
+    holder: str = Field(..., min_length=1, max_length=200, description="租约持有者标识")
+    lease_token: int = Field(
+        ..., ge=1, description="获取租约时返回的 fencing token，须与当前租约匹配"
+    )
+    ttl_seconds: float = Field(
+        default=30,
+        gt=0,
+        le=3600,
+        description="续期时长（秒，支持小数），从续期成功起算",
+    )
+
+
+class ReleaseLease(StrictModel):
+    holder: str = Field(..., min_length=1, max_length=200, description="租约持有者标识")
+    lease_token: int = Field(
+        ..., ge=1, description="获取租约时返回的 fencing token，须与当前租约匹配"
+    )
