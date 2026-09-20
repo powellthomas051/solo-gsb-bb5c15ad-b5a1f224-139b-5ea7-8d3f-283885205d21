@@ -100,6 +100,11 @@ class UpdateDocument(StrictModel):
         default=None,
         description="可选前置条件：写事务内先按输入顺序检查当前修订，全部通过才合并",
     )
+    lease_token: Optional[int] = Field(
+        default=None,
+        ge=1,
+        description="可选写入租约 fencing token；文档存在未过期租约时必须等于当前 token",
+    )
     author: Optional[str] = Field(default=None, max_length=200)
 
     @field_validator("patch")
@@ -159,6 +164,11 @@ class ReleaseItem(StrictModel):
         default=None,
         description="可选前置条件：写事务内先按输入顺序检查当前修订，全部通过才合并",
     )
+    lease_token: Optional[int] = Field(
+        default=None,
+        ge=1,
+        description="可选写入租约 fencing token；文档存在未过期租约时必须等于当前 token",
+    )
     author: Optional[str] = Field(default=None, max_length=200)
 
     @field_validator("patch")
@@ -196,3 +206,34 @@ class CreateRelease(StrictModel):
                 f"updates 中的 document_id 必须互不重复，重复项: {', '.join(duplicates)}"
             )
         return self
+
+
+# ---------------------------------------------------------------- 临时写入租约
+
+# ttl_seconds 的合法区间（秒）；省略时服务端使用 CONFIG_LEASE_DEFAULT_TTL_SECONDS
+TTL_FIELD = Field(
+    default=None, ge=1, le=3600,
+    description="租约有效期（秒），省略时使用服务端默认值",
+)
+
+
+class AcquireLease(StrictModel):
+    holder: str = Field(
+        ..., min_length=1, max_length=200, description="租约持有者标识（如部署流水线名）"
+    )
+    ttl_seconds: Optional[int] = TTL_FIELD
+
+
+class RenewLease(StrictModel):
+    holder: str = Field(..., min_length=1, max_length=200, description="租约持有者标识")
+    lease_token: int = Field(
+        ..., ge=1, description="获取租约时分配的 fencing token，续期后保持不变"
+    )
+    ttl_seconds: Optional[int] = TTL_FIELD
+
+
+class ReleaseLease(StrictModel):
+    holder: str = Field(..., min_length=1, max_length=200, description="租约持有者标识")
+    lease_token: int = Field(
+        ..., ge=1, description="当前租约的 fencing token，用于确认释放方身份"
+    )

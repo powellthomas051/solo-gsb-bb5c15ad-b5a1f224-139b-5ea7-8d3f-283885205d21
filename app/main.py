@@ -1,4 +1,4 @@
-"""FastAPI 入口：文档创建 / 读取 / 修订历史 / 修订差异 / 引用解析 / 带三方合并的更新。"""
+"""FastAPI 入口：文档创建 / 读取 / 修订历史 / 修订差异 / 引用解析 / 带三方合并的更新 / 临时写入租约。"""
 from __future__ import annotations
 
 import hashlib
@@ -23,9 +23,12 @@ from .merge import (
 )
 from .resolve import ResolutionError, resolve_document
 from .schemas import (
+    AcquireLease,
     CreateDocument,
     CreateRelease,
     Guard,
+    ReleaseLease,
+    RenewLease,
     RevertDocument,
     SetContract,
     UpdateDocument,
@@ -42,12 +45,13 @@ async def lifespan(app: FastAPI) -> Iterator[None]:
 
 app = FastAPI(
     title="共享 JSON 配置三方合并 API",
-    version="1.5.0",
+    version="1.6.0",
     description="基于 JSON Merge Patch (RFC 7386) 的共享配置存储；"
     "基线过期时递归三方合并，路径冲突返回 409；支持按修订号逆向撤销；"
     "支持任意两修订间的递归差异审计；"
     "支持跨文档 $ref 引用解析（同一读事务快照内固定全部修订）；"
-    "支持更新前置条件 guards（写事务内先检查当前修订，未满足返回 409）。",
+    "支持更新前置条件 guards（写事务内先检查当前修订，未满足返回 409）；"
+    "支持文档级临时写入租约（fencing token 单调递增，过期自动失效）。",
     lifespan=lifespan,
 )
 
@@ -199,6 +203,35 @@ def _prepare_candidate(
     }
 
 
+def _enforce_write_lease(
+    conn: sqlite3.Connection,
+    doc_id: str,
+    lease_token: int | None,
+    request_id: str,
+) -> None:
+    """写事务内按服务端 UTC 判断租约活性，并校验请求携带的 fencing token。
+
+    文档存在**未过期、未释放**的租约时，仅 ``lease_token`` 等于当前
+    fencing token 的请求可继续；否则抛 ``lease_conflict``（409），
+    调用方回滚——不写修订、不占用 request_id / release_id。
+    无有效租约（从未获取 / 已过期 / 已释放）时不做任何限制，
+    携带的（过期）token 被忽略，与原有无租约写入行为保持兼容。
+    """
+    lease = db.get_lease(conn, doc_id)
+    if not db.lease_is_active(lease, db.utcnow()):
+        return
+    if lease_token is None or lease_token != lease["fencing_token"]:
+        raise _ItemError(
+            "lease_conflict",
+            status.HTTP_409_CONFLICT,
+            document_id=doc_id,
+            request_id=request_id,
+            holder=lease["holder"],
+            expires_at=lease["expires_at"],
+            reason="文档存在未过期的写入租约，请求未携带匹配的 lease_token",
+        )
+
+
 def prepare_document_update(
     conn: sqlite3.Connection,
     doc_id: str,
@@ -206,12 +239,16 @@ def prepare_document_update(
     patch: Any,
     request_id: str,
     guards: list[Guard] | None = None,
+    lease_token: int | None = None,
 ) -> dict[str, Any]:
     """单文档 PATCH 的只读合并与校验；原子发布同样复用本入口。
 
     与 :func:`_prepare_candidate` 的顺序完全一致，路径分歧渲染为 ``conflict``；
-    *guards* 非空时先对当前修订求值，未通过渲染为 ``precondition_failed``。
+    *guards* 非空时先对当前修订求值，未通过渲染为 ``precondition_failed``；
+    最前置检查写入租约：文档存在未过期租约时 *lease_token* 必须匹配当前
+    fencing token，否则渲染为 ``lease_conflict``（先于 guards 与合并）。
     """
+    _enforce_write_lease(conn, doc_id, lease_token, request_id)
     return _prepare_candidate(
         conn, doc_id, base_revision, patch, request_id, guards=guards
     )
@@ -724,6 +761,7 @@ def update_document(
                 body.patch,
                 body.request_id,
                 guards=body.guards,
+                lease_token=body.lease_token,
             )
         except _ItemError as exc:
             raise err(exc.status_code, exc.code, **exc.extra)
@@ -995,6 +1033,7 @@ def create_release(
                             item.patch,
                             body.release_id,
                             guards=item.guards,
+                            lease_token=item.lease_token,
                         ),
                     )
                 )
@@ -1060,3 +1099,200 @@ def create_release(
         db.insert_release(conn, body.release_id, fingerprint, payload, now)
 
     return JSONResponse(payload)
+
+
+# ---------------------------------------------------------------- 临时写入租约
+
+
+def _lease_view(row: sqlite3.Row) -> dict[str, Any]:
+    """租约行的对外形态（fencing token 以 lease_token 命名暴露）。"""
+    return {
+        "document_id": row["document_id"],
+        "holder": row["holder"],
+        "lease_token": row["fencing_token"],
+        "acquired_at": row["acquired_at"],
+        "renewed_at": row["renewed_at"],
+        "expires_at": row["expires_at"],
+    }
+
+
+@app.post("/documents/{doc_id}/lease", tags=["leases"])
+def acquire_lease(
+    doc_id: str,
+    body: AcquireLease,
+    conn: sqlite3.Connection = Depends(get_conn),
+) -> JSONResponse:
+    """获取文档的临时写入租约（同一 SQLite 写事务内按服务端 UTC 判断过期）。
+
+    * 文档当前无有效租约（从未获取 / 已过期 / 已释放）→ 授予新租约，
+      分配**严格递增**的 fencing token（201，``new_lease: true``）；
+    * 同一 holder 重复获取**仍有效**的租约 → 沿用当前 token，
+      仅按 ``ttl_seconds`` 刷新过期时间（200，``new_lease: false``）；
+    * 租约由其他 holder 持有且未过期 → ``409 lease_conflict``；
+    * 过期或释放后旧 token 永久失效，任何 holder 都可立即接管（获得新 token）。
+    """
+    ttl = body.ttl_seconds or settings.lease_default_ttl_seconds
+    with db.transaction(conn):
+        if db.get_document(conn, doc_id) is None:
+            raise err(status.HTTP_404_NOT_FOUND, "not_found", document_id=doc_id)
+        now = db.utcnow()
+        row = db.get_lease(conn, doc_id)
+        if db.lease_is_active(row, now):
+            if row["holder"] != body.holder:
+                raise err(
+                    status.HTTP_409_CONFLICT,
+                    "lease_conflict",
+                    document_id=doc_id,
+                    holder=row["holder"],
+                    expires_at=row["expires_at"],
+                    reason="租约由其他持有者持有且未过期",
+                )
+            # 同一 holder 重复获取有效租约：沿用当前 token，仅刷新有效期
+            expires_at = db.utc_after(ttl)
+            db.refresh_lease(conn, doc_id, expires_at, now)
+            return JSONResponse(
+                {
+                    "document_id": doc_id,
+                    "holder": body.holder,
+                    "lease_token": row["fencing_token"],
+                    "ttl_seconds": ttl,
+                    "new_lease": False,
+                    "acquired_at": row["acquired_at"],
+                    "renewed_at": now,
+                    "expires_at": expires_at,
+                }
+            )
+        # 无有效租约：新持有者接管，fencing token 在旧值基础上严格递增
+        token = row["fencing_token"] + 1 if row is not None else 1
+        expires_at = db.utc_after(ttl)
+        db.upsert_lease(conn, doc_id, body.holder, token, expires_at, now)
+        return JSONResponse(
+            {
+                "document_id": doc_id,
+                "holder": body.holder,
+                "lease_token": token,
+                "ttl_seconds": ttl,
+                "new_lease": True,
+                "acquired_at": now,
+                "renewed_at": now,
+                "expires_at": expires_at,
+            },
+            status_code=status.HTTP_201_CREATED,
+        )
+
+
+@app.post("/documents/{doc_id}/lease/renew", tags=["leases"])
+def renew_lease(
+    doc_id: str,
+    body: RenewLease,
+    conn: sqlite3.Connection = Depends(get_conn),
+) -> dict[str, Any]:
+    """续期当前租约：holder 与 lease_token 都匹配才刷新过期时间，token 保持不变。
+
+    租约已过期 / 已释放 / 不存在，或 holder、lease_token 与当前租约不符
+    → 失败（过期租约为 ``409 lease_conflict``，旧 token 永久失效；
+    无租约为 ``404 lease_not_found``）。
+    """
+    ttl = body.ttl_seconds or settings.lease_default_ttl_seconds
+    with db.transaction(conn):
+        if db.get_document(conn, doc_id) is None:
+            raise err(status.HTTP_404_NOT_FOUND, "not_found", document_id=doc_id)
+        now = db.utcnow()
+        row = db.get_lease(conn, doc_id)
+        if row is None or row["released_at"] is not None:
+            raise err(
+                status.HTTP_404_NOT_FOUND,
+                "lease_not_found",
+                document_id=doc_id,
+                reason="文档当前没有租约",
+            )
+        if row["expires_at"] <= now:
+            raise err(
+                status.HTTP_409_CONFLICT,
+                "lease_conflict",
+                document_id=doc_id,
+                holder=row["holder"],
+                expires_at=row["expires_at"],
+                reason="租约已过期，旧 fencing token 永久失效，请重新获取租约",
+            )
+        if row["holder"] != body.holder or row["fencing_token"] != body.lease_token:
+            raise err(
+                status.HTTP_409_CONFLICT,
+                "lease_conflict",
+                document_id=doc_id,
+                holder=row["holder"],
+                expires_at=row["expires_at"],
+                reason="holder 或 lease_token 与当前租约不匹配",
+            )
+        expires_at = db.utc_after(ttl)
+        db.refresh_lease(conn, doc_id, expires_at, now)
+        return {
+            "document_id": doc_id,
+            "holder": body.holder,
+            "lease_token": row["fencing_token"],
+            "ttl_seconds": ttl,
+            "acquired_at": row["acquired_at"],
+            "renewed_at": now,
+            "expires_at": expires_at,
+        }
+
+
+@app.post("/documents/{doc_id}/lease/release", tags=["leases"])
+def release_lease(
+    doc_id: str,
+    body: ReleaseLease,
+    conn: sqlite3.Connection = Depends(get_conn),
+) -> dict[str, Any]:
+    """释放当前租约：holder 与 lease_token 都匹配才释放。
+
+    释放后文档立即恢复无租约状态（无 token 的写入重新放行）；
+    租约行保留以保证 fencing token 单调递增、旧 token 永不复用。
+    无有效租约 → ``404 lease_not_found``；身份不符 → ``409 lease_conflict``。
+    """
+    with db.transaction(conn):
+        if db.get_document(conn, doc_id) is None:
+            raise err(status.HTTP_404_NOT_FOUND, "not_found", document_id=doc_id)
+        now = db.utcnow()
+        row = db.get_lease(conn, doc_id)
+        if not db.lease_is_active(row, now):
+            raise err(
+                status.HTTP_404_NOT_FOUND,
+                "lease_not_found",
+                document_id=doc_id,
+                reason="文档当前没有未过期的有效租约",
+            )
+        if row["holder"] != body.holder or row["fencing_token"] != body.lease_token:
+            raise err(
+                status.HTTP_409_CONFLICT,
+                "lease_conflict",
+                document_id=doc_id,
+                holder=row["holder"],
+                expires_at=row["expires_at"],
+                reason="holder 或 lease_token 与当前租约不匹配",
+            )
+        db.release_lease(conn, doc_id, now)
+        return {
+            "document_id": doc_id,
+            "released": True,
+            "holder": row["holder"],
+            "lease_token": row["fencing_token"],
+            "released_at": now,
+        }
+
+
+@app.get("/documents/{doc_id}/lease", tags=["leases"])
+def get_current_lease(
+    doc_id: str, conn: sqlite3.Connection = Depends(get_conn)
+) -> dict[str, Any]:
+    """查询文档当前的有效租约（只读）；无有效租约 → ``404 lease_not_found``。"""
+    if db.get_document(conn, doc_id) is None:
+        raise err(status.HTTP_404_NOT_FOUND, "not_found", document_id=doc_id)
+    row = db.get_lease(conn, doc_id)
+    if not db.lease_is_active(row, db.utcnow()):
+        raise err(
+            status.HTTP_404_NOT_FOUND,
+            "lease_not_found",
+            document_id=doc_id,
+            reason="文档当前没有未过期的有效租约",
+        )
+    return _lease_view(row)

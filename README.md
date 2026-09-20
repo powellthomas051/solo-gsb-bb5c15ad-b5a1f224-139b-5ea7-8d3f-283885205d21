@@ -16,6 +16,13 @@
 （列出期望 / 实际与缺失语义），不写修订、不占用 `request_id`；
 `guards` 纳入幂等指纹。原子发布的每个更新项同样支持 `guards`。
 
+需要独占写入窗口时，可为文档获取**临时写入租约**：获取成功即分配**严格递增**的
+fencing token；租约未过期期间，`PATCH` 与原子发布项必须携带匹配的 `lease_token`
+才能写入，否则 `409 lease_conflict`（不写修订、不占用 `request_id` / `release_id`）。
+同一 holder 对**有效**租约的重复获取与续期沿用当前 token；租约过期或释放后
+旧 token 永久失效，任何持有者可立即接管（获得新 token）。无租约的文档写入
+行为完全不变（携带的过期 token 被忽略）。
+
 需要回滚某次历史修改时，可用 **`POST /documents/{id}/reverts` 按修订号撤销**：
 请求携带待撤销的 `revision`、`request_id` 与可选 `author`。服务端以目标修订的
 **前后快照**构造逆向 Merge Patch，再以目标修订为基线、当前内容为服务端版做三方合并：
@@ -95,6 +102,7 @@ docker compose down -v       # 停止并删除数据卷
 | `CONFIG_DB_PATH` | `/data/config.db` | SQLite 数据库文件路径，父目录自动创建 |
 | `CONFIG_HOST` | `0.0.0.0` | 监听地址 |
 | `CONFIG_HISTORY_MAX_LIMIT` | `200` | 修订历史单页返回上限 |
+| `CONFIG_LEASE_DEFAULT_TTL_SECONDS` | `60` | 写入租约默认有效期（秒）；获取 / 续期请求可用 `ttl_seconds` 覆盖（1～3600） |
 
 ## 访问地址与端口
 
@@ -114,9 +122,13 @@ docker compose down -v       # 停止并删除数据卷
 | `POST` | `/documents` | 创建文档（修订号从 1 开始） |
 | `GET` | `/documents` | 列出文档 |
 | `GET` | `/documents/{id}` | 读取当前版本（含 `revision`） |
-| `PATCH` | `/documents/{id}` | 提交 Merge Patch（三方合并，存在契约时最终校验；可选 `guards` 前置条件） |
+| `PATCH` | `/documents/{id}` | 提交 Merge Patch（三方合并，存在契约时最终校验；可选 `guards` 前置条件与 `lease_token`） |
 | `POST` | `/documents/{id}/reverts` | 按修订号撤销（逆向补丁 + 三方合并，生成普通可追溯修订） |
-| `POST` | `/releases` | 原子发布 2～20 个文档更新（单事务、聚合失败、整批幂等） |
+| `POST` | `/releases` | 原子发布 2～20 个文档更新（单事务、聚合失败、整批幂等；更新项可携带 `lease_token`） |
+| `POST` | `/documents/{id}/lease` | 获取写入租约（新持有者分配严格递增的 fencing token；同 holder 重复获取沿用并刷新） |
+| `POST` | `/documents/{id}/lease/renew` | 续期当前租约（holder + `lease_token` 匹配才刷新有效期，token 不变） |
+| `POST` | `/documents/{id}/lease/release` | 释放当前租约（holder + `lease_token` 匹配；释放后恢复无租约写入） |
+| `GET` | `/documents/{id}/lease` | 查询当前有效租约（无有效租约返回 `404 lease_not_found`） |
 | `GET` | `/documents/{id}/revisions` | 修订历史（支持 `limit`/`offset`/`order=asc|desc`） |
 | `GET` | `/documents/{id}/revisions/{rev}` | 查询指定修订的内容与 patch |
 | `GET` | `/documents/{id}/diff` | 比较两个修订快照（`from_revision`/`to_revision`），返回按 RFC 6901 路径排序的 add/remove/replace 差异 |
@@ -299,6 +311,117 @@ HTTP/1.1 409 Conflict
 - `POST /releases` 的每个更新项同样支持 `guards`：任一项未通过按
   `precondition_failed`（`status_code: 409`）聚合进 `failures`，
   整批回滚且不占用 `release_id`；guards 同样纳入整批幂等指纹。
+
+### 临时写入租约（fencing token）
+
+每个文档至多一个**当前租约**，存放在独立的 `leases` 表中，随 SQLite 数据卷
+持久化。获取、续期、释放与写入强制都在**同一个 SQLite 写事务**内按
+**服务端 UTC** 判断过期（`expires_at` 与当前时间比较），不依赖调用方时钟。
+
+#### 获取（POST /documents/{id}/lease）
+
+```bash
+curl -X POST http://localhost:8000/documents/demo/lease \
+  -H 'Content-Type: application/json' \
+  -d '{"holder": "deploy-bot", "ttl_seconds": 120}'
+```
+
+```json
+HTTP/1.1 201 Created
+{
+  "document_id": "demo",
+  "holder": "deploy-bot",
+  "lease_token": 1,
+  "ttl_seconds": 120,
+  "new_lease": true,
+  "acquired_at": "2026-09-20T04:23:20.091267Z",
+  "renewed_at": "2026-09-20T04:23:20.091267Z",
+  "expires_at": "2026-09-20T04:25:20.091359Z"
+}
+```
+
+- 文档无有效租约（从未获取 / 已过期 / 已释放）→ 授予新租约，`201`，
+  分配**严格递增**的 fencing token（每文档从 1 开始，逐次 +1，永不复用）；
+- **同一 holder** 重复获取仍有效的租约 → `200`，`"new_lease": false`，
+  **沿用当前 token**，仅按 `ttl_seconds` 刷新过期时间；
+- 租约由**其他 holder** 持有且未过期 → `409 lease_conflict`
+  （响应含当前 `holder` 与 `expires_at`，不泄露当前 token）；
+- `ttl_seconds` 可省略，默认取 `CONFIG_LEASE_DEFAULT_TTL_SECONDS`（60），
+  合法区间 1～3600 秒。
+
+#### 续期（POST /documents/{id}/lease/renew）
+
+```bash
+curl -X POST http://localhost:8000/documents/demo/lease/renew \
+  -H 'Content-Type: application/json' \
+  -d '{"holder": "deploy-bot", "lease_token": 1, "ttl_seconds": 120}'
+```
+
+holder 与 `lease_token` **都**匹配当前有效租约才刷新过期时间，`200`，
+token 保持不变。租约不存在 → `404 lease_not_found`；租约**已过期** →
+`409 lease_conflict`（旧 token 永久失效，须重新获取）；holder 或 token
+不符 → `409 lease_conflict`。
+
+#### 释放（POST /documents/{id}/lease/release）
+
+```bash
+curl -X POST http://localhost:8000/documents/demo/lease/release \
+  -H 'Content-Type: application/json' \
+  -d '{"holder": "deploy-bot", "lease_token": 1}'
+# 200 → {"document_id":"demo","released":true,"holder":"deploy-bot",
+#        "lease_token":1,"released_at":"..."}
+```
+
+holder 与 `lease_token` 都匹配才释放；释放后文档立即恢复无租约状态
+（无 token 的写入重新放行）。无有效租约 → `404 lease_not_found`；
+身份不符 → `409 lease_conflict`。释放只标记 `released_at`，**不删除租约行**，
+保证 fencing token 单调递增、旧 token 永不复用。
+
+#### 查询（GET /documents/{id}/lease）
+
+```bash
+curl http://localhost:8000/documents/demo/lease
+# 200 → {"document_id":"demo","holder":"deploy-bot","lease_token":1,
+#        "acquired_at":"...","renewed_at":"...","expires_at":"..."}
+# 无有效租约（从未获取 / 已过期 / 已释放）→ 404 lease_not_found
+```
+
+#### 写入强制：lease_token
+
+文档存在**未过期、未释放**的租约时，`PATCH /documents/{id}` 与
+`POST /releases` 的更新项必须携带等于当前 fencing token 的 `lease_token`
+（正整数）才能写入；缺失或不匹配 → `409 lease_conflict`：
+
+```json
+HTTP/1.1 409 Conflict
+{
+  "detail": {
+    "error": "lease_conflict",
+    "document_id": "demo",
+    "request_id": "req-001",
+    "holder": "deploy-bot",
+    "expires_at": "2026-09-20T04:25:20.091359Z",
+    "reason": "文档存在未过期的写入租约，请求未携带匹配的 lease_token"
+  }
+}
+```
+
+原子发布中任一项租约不符 → 整批 `422 release_failed`，该项以
+`"error": "lease_conflict"`（`status_code: 409`）聚合进 `failures`。
+
+语义要点：
+
+- 检查顺序：**幂等重放 → 租约 → guards → 基线 → 三方合并 → 契约校验**。
+  已登记的 `request_id` 幂等重放不发生写入，不要求 token；
+- 租约冲突在事务内回滚：**不写修订、不占用 `request_id` / `release_id`**，
+  修正后可用同一 ID 重试；
+- 无有效租约时写入行为与引入租约前完全一致：不带 token 直接放行，
+  携带的（过期）token 被忽略；
+- 租约过期后旧 token **永久失效**：不能续期，新持有者接管后旧 token
+  写入必然 `409`；过期且无人接管期间写入不受限（与无租约一致）；
+- `lease_token` 是写入凭证而非内容：**不纳入** PATCH / 发布的幂等指纹，
+  同一 `request_id` 换用新 token 重放仍返回原结果；
+- 撤销接口（`POST /documents/{id}/reverts`）不参与租约强制。
 
 ### 撤销修订（POST /documents/{id}/reverts）
 
@@ -754,9 +877,11 @@ HTTP/1.1 422 Unprocessable Entity
 | `201` | 文档创建成功 |
 | `404 not_found` | 文档不存在（契约接口同理） |
 | `404 schema_not_found` | 文档存在但未设置契约（GET） |
+| `404 lease_not_found` | 文档当前没有（未过期的）租约（查询 / 续期 / 释放时） |
 | `404 revision_not_found` | 指定修订不存在（单修订查询 / 差异审计，`missing_revisions` 指出缺失修订） |
 | `409 conflict` | 三方合并存在分歧路径（原子发布单项失败时聚合在 `failures` 中） |
 | `409 precondition_failed` | guards 前置条件未满足（`failures` 列出 expected/actual 与缺失侧；不写修订、不占用 request_id） |
+| `409 lease_conflict` | 文档存在未过期写入租约而请求未携带匹配的 lease_token（PATCH / 发布项），或租约获取 / 续期 / 释放的持有者、token 冲突（不写修订、不占用 request_id/release_id） |
 | `409 revert_conflict` | 撤销目标修订涉及的路径后来被改成不同值（不写新修订、不占用 request_id） |
 | `409 request_id_conflict` | 同一 request_id 对应了不同内容（PATCH 与撤销共用幂等表） |
 | `409 release_id_conflict` | 同一 release_id 对应了不同的整批请求 |
@@ -778,13 +903,13 @@ HTTP/1.1 422 Unprocessable Entity
 ```
 .
 ├── app/
-│   ├── main.py        # FastAPI 路由与更新编排（事务、幂等、guards、冲突响应、契约接口、差异审计、引用解析）
+│   ├── main.py        # FastAPI 路由与更新编排（事务、幂等、guards、冲突响应、契约接口、差异审计、引用解析、写入租约）
 │   ├── merge.py       # RFC 7386 打补丁 + 递归三方合并（无框架依赖，可单测）
 │   ├── guards.py      # 更新前置条件求值（RFC 6901 指针 + 等值/缺失检查，无框架依赖，可单测）
 │   ├── diff.py        # 两快照递归差异审计（add/remove/replace，无框架依赖，可单测）
 │   ├── resolve.py     # 跨文档 $ref 引用递归解析（环检测、深度上限，无框架依赖，可单测）
 │   ├── validation.py  # JSON Schema 2020-12 元校验与实例校验（错误稳定排序）
-│   ├── db.py          # SQLite 连接、自动建表、文档/修订/幂等/契约表读写、读写事务
+│   ├── db.py          # SQLite 连接、自动建表、文档/修订/幂等/契约/租约表读写、读写事务
 │   ├── schemas.py     # Pydantic 请求模型（额外字段拒绝）
 │   └── config.py      # 环境变量配置
 ├── tests/
@@ -795,7 +920,8 @@ HTTP/1.1 422 Unprocessable Entity
 │   ├── test_releases.py  # POST /releases 原子发布集成测试（17 例）
 │   ├── test_diff.py      # GET /documents/{id}/diff 差异审计集成测试（17 例）
 │   ├── test_resolve.py   # GET /documents/{id}/resolved 引用解析集成测试（33 例）
-│   └── test_guards.py    # guards 前置条件与发布项 guards 集成测试（27 例）
+│   ├── test_guards.py    # guards 前置条件与发布项 guards 集成测试（27 例）
+│   └── test_leases.py    # 写入租约获取/续期/释放/查询与写入强制集成测试（24 例）
 ├── Dockerfile
 ├── docker-compose.yml
 ├── requirements.txt

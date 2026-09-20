@@ -14,6 +14,10 @@ class Settings:
     port: int = int(os.getenv("CONFIG_PORT", "8000") or "8000")
     # 历史查询单页上限
     history_max_limit: int = int(os.getenv("CONFIG_HISTORY_MAX_LIMIT", "200") or "200")
+    # 写入租约默认 TTL（秒）；请求可携带 ttl_seconds 覆盖（上限 3600）
+    lease_default_ttl_seconds: int = int(
+        os.getenv("CONFIG_LEASE_DEFAULT_TTL_SECONDS", "60") or "60"
+    )
 
 
 settings = Settings()

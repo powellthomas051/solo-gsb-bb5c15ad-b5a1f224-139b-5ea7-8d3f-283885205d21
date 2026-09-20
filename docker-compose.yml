@@ -12,6 +12,7 @@ services:
       CONFIG_PORT: "8000"
       CONFIG_DB_PATH: "/data/config.db"
       CONFIG_HISTORY_MAX_LIMIT: "${CONFIG_HISTORY_MAX_LIMIT:-200}"
+      CONFIG_LEASE_DEFAULT_TTL_SECONDS: "${CONFIG_LEASE_DEFAULT_TTL_SECONDS:-60}"
     volumes:
       - config-data:/data
     healthcheck:
